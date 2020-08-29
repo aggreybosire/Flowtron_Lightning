@@ -37,7 +37,7 @@ def load_filepaths_and_text(filename, split="|"):
 def load_wav_to_torch(full_path):
     """ Loads wavdata into torch array """
     sampling_rate, data = read(full_path)
-    return torch.from_numpy(data).float(), sampling_rate
+    return torch.FloatTensor(data.astype(np.float32)), sampling_rate
 
 
 class Data(torch.utils.data.Dataset):

@@ -27,21 +27,7 @@ import argparse
 import json
 import os
 import ast
-from flowtron_plotting_utils import plot_alignment_to_numpy, plot_gate_outputs_to_numpy
-
-def get_mask_from_lengths(lengths):
-    """Constructs binary mask from a 1D torch tensor of input lengths
-
-    Args:
-        lengths (torch.tensor): 1D tensor
-    Returns:
-        mask (torch.tensor): num_sequences x max_length x 1 binary tensor
-    """
-    max_len = torch.max(lengths).item()
-    ids = torch.arange(0, max_len, out=torch.cuda.LongTensor(max_len))
-    mask = (ids < lengths.unsqueeze(1)).byte()
-    return mask
-
+from flowtron_logger import FlowtronLogger
 
 def update_params(config, params):
     for param in params:
@@ -63,6 +49,20 @@ def update_params(config, params):
             print("{}, {} params not updated".format(k, v))
 
 
+def get_mask_from_lengths(lengths):
+    """Constructs binary mask from a 1D torch tensor of input lengths
+
+    Args:
+        lengths (torch.tensor): 1D tensor
+    Returns:
+        mask (torch.tensor): num_sequences x max_length x 1 binary tensor
+    """
+    max_len = torch.max(lengths).item()
+    ids = torch.arange(0, max_len, out=torch.LongTensor(max_len))
+    mask = (ids < lengths.unsqueeze(1)).byte()
+    return mask
+
+
 class FlowtronLoss(torch.nn.Module):
     def __init__(self, sigma=1.0, gm_loss=False, gate_loss=True):
         super(FlowtronLoss, self).__init__()
@@ -75,9 +75,8 @@ class FlowtronLoss(torch.nn.Module):
         z, log_s_list, gate_pred, mean, log_var, prob = model_output
 
         # create mask for outputs computed on padded data
-        mask = get_mask_from_lengths(lengths).transpose(0, 1)[..., None]
-        mask_inverse = ~mask
-        mask, mask_inverse = mask.float(), mask_inverse.float()
+        mask = get_mask_from_lengths(lengths).transpose(0, 1)[..., None]        
+        mask = mask.float()
         n_mel_dims = z.size(2)
         n_elements = mask.sum()
         for i, log_s in enumerate(log_s_list):
@@ -422,13 +421,13 @@ class AR_Back_Step(torch.nn.Module):
     def forward(self, mel, text, mask, out_lens):
         mel = torch.flip(mel, (0, ))
         # backwards flow, send padded zeros back to end
-        for k in range(1, mel.size(1)):
+        for k in range(mel.size(1)):
             mel[:, k] = mel[:, k].roll(out_lens[k].item(), dims=0)
 
         mel, log_s, gates, attn = self.ar_step(mel, text, mask, out_lens)
 
         # move padded zeros back to beginning
-        for k in range(1, mel.size(1)):
+        for k in range(mel.size(1)):
             mel[:, k] = mel[:, k].roll(-out_lens[k].item(), dims=0)
 
         return torch.flip(mel, (0, )), log_s, gates, attn
@@ -530,6 +529,7 @@ class AR_Step(torch.nn.Module):
         mel = torch.exp(log_s) * mel + b
         return mel, log_s, gates, attention_weights
 
+    
     def infer(self, residual, text):
         attention_weights = []
         total_output = []  # seems 10FPS faster than pre-allocation
@@ -577,11 +577,6 @@ class Flowtron(pl.LightningModule):
         self.encoder = Encoder(norm_fn=norm_fn, encoder_embedding_dim=n_text_dim)
         self.dummy_speaker_embedding = dummy_speaker_embedding
 
-        self.flowtronloss = FlowtronLoss()
-        #self.datacollate = DataCollate()
-        #self.data = Data(**data_config)
-        self.ignore_keys = ['training_files', 'validation_files']
-
         if n_components > 1:
             self.mel_encoder = MelEncoder(mel_encoder_n_hidden, norm_fn=norm_fn)
             self.gaussian_mixture = GaussianMixture(mel_encoder_n_hidden,
@@ -589,8 +584,7 @@ class Flowtron(pl.LightningModule):
                                                     n_mel_channels,
                                                     fixed_gaussian, mean_scale)
 
-        for i in range(n_flows
-        ):
+        for i in range(n_flows):
             add_gate = True if (i == (n_flows-1) and use_gate_layer) else False
             if i % 2 == 0:
                 self.flows.append(AR_Step(n_mel_channels, n_speaker_dim,
@@ -632,132 +626,7 @@ class Flowtron(pl.LightningModule):
             attns_list.append(attn)
         return mel, log_s_list, gate, attns_list,  mean, log_var, prob
     
-        def warmstart(checkpoint_path, model, include_layers=None):
-            print("Warm starting model", checkpoint_path)
-            pretrained_dict = torch.load(train_config['checkpoint_path'], map_location='cpu')
-            if 'model' in pretrained_dict:
-                pretrained_dict = pretrained_dict['model'].state_dict()
-            else:
-                pretrained_dict = pretrained_dict['state_dict']
-
-            if include_layers is not None:
-                pretrained_dict = {k: v for k, v in pretrained_dict.items()
-                                if any(l in k for l in train_config['include_layers'])}
-
-            model_dict = model.state_dict()
-            pretrained_dict = {k: v for k, v in pretrained_dict.items()
-                            if k in model_dict}
-
-            if pretrained_dict['speaker_embedding.weight'].shape != model_dict['speaker_embedding.weight'].shape:
-                del pretrained_dict['speaker_embedding.weight']
-
-            model_dict.update(pretrained_dict)
-            model.load_state_dict(model_dict)
-            return model
-
-    def load_checkpoint(checkpoint_path, model, optimizer, ignore_layers=[]):
-        assert os.path.isfile(checkpoint_path)
-        checkpoint_dict = torch.load(train_config['checkpoint_path'], map_location='cpu')
-        iteration = checkpoint_dict['iteration']
-        model_dict = checkpoint_dict['model'].state_dict()
-
-        if len(train_config['ignore_layers']) > 0:
-            model_dict = {k: v for k, v in model_dict.items()
-                        if k not in train_config['ignore_layers']}
-            dummy_dict = model.state_dict()
-            dummy_dict.update(model_dict)
-            model_dict = dummy_dict
-        else:
-            optimizer.load_state_dict(checkpoint_dict['optimizer'])
-
-        model.load_state_dict(model_dict)
-        print("Loaded checkpoint '{}' (iteration {})" .format(
-            checkpoint_path, iteration))
-        return model, optimizer, iteration
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=train_config['learning_rate'],
-                                 weight_decay=train_config['weight_decay'])
-        return optimizer
-
-
-    def training_step(self, batch, batch_idx):
-        mel, speaker_vecs, text, in_lens, out_lens, gate_target = batch
-        
-        z, log_s_list, gate_pred, attn, mean, log_var, prob = model(
-                mel, speaker_vecs, text, in_lens, out_lens)
-        
-        criterion = self.flowtronloss(train_config['sigma'], model_config['n_components'] > 1,
-                             model_config['use_gate_layer'])
-        model = self(**model_config)
-        if train_config['warmstart_checkpoint_path'] != "":
-            model = warmstart(train_config['warmstart_checkpoint_path'], model, train_config['include_layers'])
-
-        if train_config['checkpoint_path'] != "":
-            model, optimizer, iteration = load_checkpoint(train_config['checkpoint_path'], model,
-                                                      optimizer, train_config['ignore_layers'])
-        loss = criterion((z, log_s_list, gate_pred, mean, log_var, prob),
-                             gate_target, out_lens)
-        #result = pl.TrainResult(loss, checkpoint_on=loss)
-        return {'loss': loss}
-
-    def train_dataloader(self):
-        trainset = Data(data_config['training_files'],
-                    **dict((k, v) for k, v in data_config.items()
-                    if k not in self.ignore_keys))
-        
-        collate_fn = DataCollate()
-        train_sampler, shuffle = None, True
-        train_loader = DataLoader(trainset, num_workers=1, shuffle=shuffle,
-                              sampler=train_sampler, batch_size=train_config['batch_size'],
-                              pin_memory=False, drop_last=True,
-                              collate_fn=collate_fn)
-        return train_loader
-
-    def val_dataloader(self):
-        trainset = Data(data_config['training_files'],
-                    **dict((k, v) for k, v in data_config.items()
-                    if k not in self.ignore_keys))
-        valset = Data(data_config['validation_files'],
-                  **dict((k, v) for k, v in data_config.items()
-                  if k not in self.ignore_keys), speaker_ids=trainset.speaker_ids)
-        collate_fn = DataCollate()
-        val_sampler = None
-        val_loader = DataLoader(valset, sampler=val_sampler, num_workers=1,
-                                shuffle=False, batch_size=train_config['batch_size'],
-                                pin_memory=False, collate_fn=collate_fn)
-        return val_loader
-
-    def validation_step(self):
-        mel, speaker_vecs, text, in_lens, out_lens, gate_target = batch
-        z, log_s_list, gate_pred, attn, mean, log_var, prob = model(
-                mel, speaker_vecs, text, in_lens, out_lens)
-        criterion = self.flowtronloss(train_config['sigma'], model_config['n_components'] > 1,
-                             model_config['use_gate_layer'])
-        loss = criterion((z, log_s_list, gate_pred, mean, log_var, prob),
-                             gate_target, out_lens)
-        reduced_val_loss = loss.item()
-        val_loss += reduced_val_loss
-        idx = random.randint(0, len(gate_out) - 1)
-        for i in range(len(attns)):
-            self.add_image(
-                'attention_weights_{}'.format(i),
-                plot_alignment_to_numpy(attns[i][idx].data.cpu().numpy().T),
-                iteration,
-                dataformats='HWC')
-
-        if gate_pred is not None:
-            gate_pred = gate_pred.transpose(0, 1)[:, :, 0]
-            self.add_image(
-                "gate",
-                plot_gate_outputs_to_numpy(
-                    gate_out[idx].data.cpu().numpy(),
-                    torch.sigmoid(gate_pred[idx]).data.cpu().numpy()),
-                iteration, dataformats='HWC')
-
-        return {'val_loss':val_loss}
-
-    #def validation_epoch_end()
+    
     def infer(self, residual, speaker_vecs, text, temperature=1.0,
               gate_threshold=0.5):
         speaker_vecs = speaker_vecs*0 if self.dummy_speaker_embedding else speaker_vecs
@@ -784,7 +653,124 @@ class Flowtron(pl.LightningModule):
         if hasattr(flow, 'gate_layer'):
             flow.gate_threshold = gate_threshold
 
-#model = Flowtron(1,128,185,512,2,80,1024,640,2,"true",512,0,"true",0.0,"false")
+    
+    def warmstart(self,checkpoint_path, model, include_layers=None):
+        print("Warm starting model", checkpoint_path)
+        pretrained_dict = torch.load(checkpoint_path, map_location='cpu')
+        if 'model' in pretrained_dict:
+            pretrained_dict = pretrained_dict['model'].state_dict()
+        else:
+            pretrained_dict = pretrained_dict['state_dict']
+
+        if include_layers is not None:
+            pretrained_dict = {k: v for k, v in pretrained_dict.items()
+                            if any(l in k for l in include_layers)}
+
+        model_dict = model.state_dict()
+        pretrained_dict = {k: v for k, v in pretrained_dict.items()
+                        if k in model_dict}
+
+        if pretrained_dict['speaker_embedding.weight'].shape != model_dict['speaker_embedding.weight'].shape:
+            del pretrained_dict['speaker_embedding.weight']
+
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict)
+        return model
+
+
+    def load_checkpoint(self,checkpoint_path, model, optimizer, ignore_layers=[]):
+        assert os.path.isfile(checkpoint_path)
+        checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
+        iteration = checkpoint_dict['iteration']
+        model_dict = checkpoint_dict['model'].state_dict()
+
+        if len(ignore_layers) > 0:
+            model_dict = {k: v for k, v in model_dict.items()
+                        if k not in ignore_layers}
+            dummy_dict = model.state_dict()
+            dummy_dict.update(model_dict)
+            model_dict = dummy_dict
+        else:
+            optimizer.load_state_dict(checkpoint_dict['optimizer'])
+
+        model.load_state_dict(model_dict)
+        print("Loaded checkpoint '{}' (iteration {})" .format(
+            checkpoint_path, iteration))
+        return model, optimizer, iteration
+
+
+    
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=train_config['learning_rate'],
+                                 weight_decay=train_config['weight_decay'])
+        return optimizer
+
+
+    def training_step(self, batch, batch_idx):
+        mel, speaker_vecs, text, in_lens, out_lens, gate_target = batch
+        z, log_s_list, gate_pred, attn, mean, log_var, prob = self.forward(
+                mel, speaker_vecs, text, in_lens, out_lens)        
+        criterion = self.flowtronloss(train_config['sigma'], model_config['n_components'] > 1,
+                             model_config['use_gate_layer'])
+                
+        loss = criterion((z, log_s_list, gate_pred, mean, log_var, prob),
+                             gate_target, out_lens)
+        result = pl.TrainResult(loss)
+        result.log('train_loss', loss)
+        self.logger.add_scalar('training_loss', reduced_loss, iteration)
+        self.logger.add_scalar('learning_rate', learning_rate, iteration)
+        return result
+
+    def train_dataloader(self):
+        ignore_keys = ['training_files', 'validation_files']
+        trainset = Data(data_config['training_files'],
+                        **dict((k, v) for k, v in data_config.items()
+                        if k not in ignore_keys))
+        
+        collate_fn = DataCollate()        
+        shuffle = True
+        train_loader = DataLoader(trainset, num_workers=0, shuffle=shuffle,
+                              batch_size=train_config['batch_size'],
+                              pin_memory=False, drop_last=True,
+                              collate_fn=collate_fn)
+        return train_loader
+
+    def val_dataloader(self):
+        ignore_keys = ['training_files', 'validation_files']
+        trainset = Data(data_config['training_files'],
+                        **dict((k, v) for k, v in data_config.items()
+                        if k not in ignore_keys))
+        valset = Data(data_config['validation_files'],
+                  **dict((k, v) for k, v in data_config.items()
+                  if k not in ignore_keys), speaker_ids=trainset.speaker_ids)
+        collate_fn = DataCollate()
+        
+        val_loader = DataLoader(valset, num_workers=0,
+                                shuffle=False, batch_size=train_config['batch_size'],
+                                pin_memory=False, collate_fn=collate_fn)
+        return val_loader
+
+    def validation_step(self, batch, batch_idx):
+        mel, speaker_vecs, text, in_lens, out_lens, gate_target = batch
+        z, log_s_list, gate_pred, attn, mean, log_var, prob = self.forward(
+                mel, speaker_vecs, text, in_lens, out_lens)
+        criterion = self.flowtronloss(train_config['sigma'], model_config['n_components'] > 1,
+                             model_config['use_gate_layer'])
+        loss = criterion((z, log_s_list, gate_pred, mean, log_var, prob),
+                             gate_target, out_lens)
+        reduced_val_loss = loss.item()
+        val_loss += reduced_val_loss
+        
+        result = pl.EvalResult(val_loss)
+
+        result.log('val_loss', val_loss)
+        self.logger.log_validation(val_loss, attns, gate_pred, gate_target, self.global_step)
+        return result
+        #return {'val_loss':val_loss}
+
+    #def validation_epoch_end()
+ 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--config', type=str,default='config.json',
@@ -810,10 +796,32 @@ if __name__ == "__main__":
     global model_config
     model_config = config["model_config"]
 
+    # Make sure the launcher sets `RANK` and `WORLD_SIZE`.
+    rank = int(os.getenv('RANK', '0'))
+    n_gpus = int(os.getenv("WORLD_SIZE", '1'))
+    print('> got rank {} and world size {} ...'.format(rank, n_gpus))
+
+    if n_gpus == 1 and rank != 0:
+        raise Exception("Doing single GPU training on rank > 0")
+    
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = False
     
     #tb_logger = pl_loggers.TensorBoardLogger('logs/')
+     # Get shared output_directory ready
+    output_directory = train_config['output_directory']
+    if rank == 0 and not os.path.isdir(output_directory):
+        os.makedirs(output_directory)
+        os.chmod(output_directory, 0o775)
+    print("output directory", output_directory)
+
+    # if train_config['with_tensorboard'] and rank == 0:
+    if train_config['with_tensorboard'] and rank == 0:
+        flow_logger = FlowtronLogger(os.path.join(output_directory, 'logs'))
+    
+    # checkpoint_path = "{}/model_{}".format(
+    #                     output_directory, self.global_step)
+
     model = Flowtron(**model_config)
-    trainer = pl.Trainer(fast_dev_run=True)
+    trainer = pl.Trainer(logger=flow_logger,fast_dev_run=True)
     trainer.fit(model)
