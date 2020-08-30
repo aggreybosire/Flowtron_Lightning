@@ -25,15 +25,15 @@ class FlowtronLogger(TensorBoardLogger):
         super(FlowtronLogger, self).__init__(logdir)
 
     def log_training(self, loss, learning_rate, iteration):
-            self.add_scalar("training.loss", loss, iteration)
-            self.add_scalar("learning.rate", learning_rate, iteration)
+            self.experiment.add_scalar("training.loss", loss, iteration)
+            self.experiment.add_scalar("learning.rate", learning_rate, iteration)
 
     def log_validation(self, loss, attns, gate_pred, gate_out, iteration):
-        self.add_scalar("validation.loss", loss, iteration)
+        self.experiment.add_scalar("validation.loss", loss, iteration)
 
         idx = random.randint(0, len(gate_out) - 1)
         for i in range(len(attns)):
-            self.add_image(
+            self.experiment.add_figure(
                 'attention_weights_{}'.format(i),
                 plot_alignment_to_numpy(attns[i][idx].data.cpu().numpy().T),
                 iteration,
@@ -41,7 +41,7 @@ class FlowtronLogger(TensorBoardLogger):
 
         if gate_pred is not None:
             gate_pred = gate_pred.transpose(0, 1)[:, :, 0]
-            self.add_image(
+            self.experiment.add_figure(
                 "gate",
                 plot_gate_outputs_to_numpy(
                     gate_out[idx].data.cpu().numpy(),

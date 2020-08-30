@@ -1,3 +1,10 @@
+## Flowtron_Lightning: Refactor Flowtron TTS to pytorch lightning.
+Work in progress....
+### TODO:
+      1. Parser for gpu/tpu, gradient accumulation etc
+      2. Warmstart checkpoint
+      3. Refactor logger
+
 ![Flowtron](https://nv-adlr.github.io/images/flowtron_logo.png "Flowtron")
 
 ## Flowtron: an Autoregressive Flow-based Network for Text-to-Mel-spectrogram Synthesis

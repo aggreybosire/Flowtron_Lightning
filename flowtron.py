@@ -718,8 +718,8 @@ class Flowtron(pl.LightningModule):
                              gate_target, out_lens)
         result = pl.TrainResult(loss)
         result.log('train_loss', loss)
-        self.logger.add_scalar('training_loss', reduced_loss, iteration)
-        self.logger.add_scalar('learning_rate', learning_rate, iteration)
+        self.logger.add_scalar('training_loss', loss, self.global_step)
+        self.logger.add_scalar('learning_rate', learning_rate, self.global_step)
         return result
 
     def train_dataloader(self):
