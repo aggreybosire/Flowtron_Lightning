@@ -15,11 +15,13 @@
 #
 ###############################################################################
 import numpy as np
+import random
 import torch
 from torch import nn
 from torch.nn import functional as F
 from data import Data, DataCollate
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 import pytorch_lightning as pl
 from pytorch_lightning import loggers as pl_loggers
@@ -27,7 +29,9 @@ import argparse
 import json
 import os
 import ast
-from flowtron_logger import FlowtronLogger
+from pytorch_lightning.loggers import TensorBoardLogger
+from flowtron_plotting_utils import plot_alignment_to_numpy, plot_gate_outputs_to_numpy
+
 
 def update_params(config, params):
     for param in params:
@@ -58,8 +62,8 @@ def get_mask_from_lengths(lengths):
         mask (torch.tensor): num_sequences x max_length x 1 binary tensor
     """
     max_len = torch.max(lengths).item()
-    ids = torch.arange(0, max_len, out=torch.LongTensor(max_len))
-    mask = (ids < lengths.unsqueeze(1)).byte()
+    ids = torch.arange(0, max_len, out=torch.cuda.LongTensor(max_len))
+    mask = (ids < lengths.unsqueeze(1)).bool()
     return mask
 
 
@@ -349,7 +353,7 @@ class Encoder(nn.Module):
             for conv in self.convolutions:
                 x = F.dropout(F.relu(conv(x)), 0.5, self.training)
             x = x.transpose(1, 2)
-        x = nn.utils.rnn.pack_padded_sequence(x, in_lens, batch_first=True)
+        x = nn.utils.rnn.pack_padded_sequence(x, in_lens.cpu(), batch_first=True)
 
         self.lstm.flatten_parameters()
         outputs, _ = self.lstm(x)
@@ -678,7 +682,7 @@ class Flowtron(pl.LightningModule):
         return model
 
 
-    def load_checkpoint(self,checkpoint_path, model, optimizer, ignore_layers=[]):
+    def on_load_checkpoint(self,checkpoint_path, model, optimizer, ignore_layers=[]):
         assert os.path.isfile(checkpoint_path)
         checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
         iteration = checkpoint_dict['iteration']
@@ -711,15 +715,17 @@ class Flowtron(pl.LightningModule):
         mel, speaker_vecs, text, in_lens, out_lens, gate_target = batch
         z, log_s_list, gate_pred, attn, mean, log_var, prob = self.forward(
                 mel, speaker_vecs, text, in_lens, out_lens)        
-        criterion = self.flowtronloss(train_config['sigma'], model_config['n_components'] > 1,
+        criterion = FlowtronLoss(train_config['sigma'], model_config['n_components'] > 1,
                              model_config['use_gate_layer'])
                 
         loss = criterion((z, log_s_list, gate_pred, mean, log_var, prob),
                              gate_target, out_lens)
         result = pl.TrainResult(loss)
         result.log('train_loss', loss)
-        self.logger.add_scalar('training_loss', loss, self.global_step)
-        self.logger.add_scalar('learning_rate', learning_rate, self.global_step)
+        #self.experiment.add_scalar("training.loss", loss, self.global_step)
+        #self.experiment.add_scalar("learning.rate", learning_rate, self.global_step)
+        self.logger.experiment.add_scalar('training_loss', loss, self.global_step)
+        #self.logger.log_training('learning_rate', learning_rate, self.global_step)
         return result
 
     def train_dataloader(self):
@@ -730,9 +736,9 @@ class Flowtron(pl.LightningModule):
         
         collate_fn = DataCollate()        
         shuffle = True
-        train_loader = DataLoader(trainset, num_workers=0, shuffle=shuffle,
+        train_loader = DataLoader(trainset, num_workers=8, shuffle=shuffle,
                               batch_size=train_config['batch_size'],
-                              pin_memory=False, drop_last=True,
+                              pin_memory=True, drop_last=True,
                               collate_fn=collate_fn)
         return train_loader
 
@@ -746,26 +752,45 @@ class Flowtron(pl.LightningModule):
                   if k not in ignore_keys), speaker_ids=trainset.speaker_ids)
         collate_fn = DataCollate()
         
-        val_loader = DataLoader(valset, num_workers=0,
+        val_loader = DataLoader(valset, num_workers=8,
                                 shuffle=False, batch_size=train_config['batch_size'],
-                                pin_memory=False, collate_fn=collate_fn)
+                                pin_memory=True, collate_fn=collate_fn)
         return val_loader
 
     def validation_step(self, batch, batch_idx):
         mel, speaker_vecs, text, in_lens, out_lens, gate_target = batch
         z, log_s_list, gate_pred, attn, mean, log_var, prob = self.forward(
                 mel, speaker_vecs, text, in_lens, out_lens)
-        criterion = self.flowtronloss(train_config['sigma'], model_config['n_components'] > 1,
+        criterion = FlowtronLoss(train_config['sigma'], model_config['n_components'] > 1,
                              model_config['use_gate_layer'])
-        loss = criterion((z, log_s_list, gate_pred, mean, log_var, prob),
+        val_loss = criterion((z, log_s_list, gate_pred, mean, log_var, prob),
                              gate_target, out_lens)
-        reduced_val_loss = loss.item()
-        val_loss += reduced_val_loss
+        #reduced_val_loss = loss.item()
+        
+        #val_loss = reduced_val_loss
         
         result = pl.EvalResult(val_loss)
 
         result.log('val_loss', val_loss)
-        self.logger.log_validation(val_loss, attns, gate_pred, gate_target, self.global_step)
+        self.logger.experiment.add_scalar('validation.loss', val_loss, self.global_step)
+        idx = random.randint(0, len(gate_target) - 1)
+        for i in range(len(attn)):
+            self.logger.experiment.add_image(
+                'attention_weights_{}'.format(i),
+                plot_alignment_to_numpy(attn[i][idx].data.cpu().numpy().T),
+                self.global_step,
+                dataformats='HWC')
+
+        if gate_pred is not None:
+            gate_pred = gate_pred.transpose(0, 1)[:, :, 0]
+            self.logger.experiment.add_image(
+                "gate",
+                plot_gate_outputs_to_numpy(
+                    gate_target[idx].data.cpu().numpy(),
+                    torch.sigmoid(gate_pred[idx]).data.cpu().numpy()),
+                self.global_step, dataformats='HWC')
+        #self.logger.log_validation(val_loss, attn, gate_pred, gate_target, self.global_step)
+
         return result
         #return {'val_loss':val_loss}
 
@@ -804,8 +829,6 @@ if __name__ == "__main__":
     if n_gpus == 1 and rank != 0:
         raise Exception("Doing single GPU training on rank > 0")
     
-    torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = False
     
     #tb_logger = pl_loggers.TensorBoardLogger('logs/')
      # Get shared output_directory ready
@@ -817,11 +840,13 @@ if __name__ == "__main__":
 
     # if train_config['with_tensorboard'] and rank == 0:
     if train_config['with_tensorboard'] and rank == 0:
-        flow_logger = FlowtronLogger(os.path.join(output_directory, 'logs'))
+        flow_logger = TensorBoardLogger(os.path.join(output_directory, 'logs'))
     
     # checkpoint_path = "{}/model_{}".format(
     #                     output_directory, self.global_step)
 
     model = Flowtron(**model_config)
-    trainer = pl.Trainer(logger=flow_logger,fast_dev_run=True)
+    trainer = pl.Trainer(logger=flow_logger,progress_bar_refresh_rate=20,gpus=1,fast_dev_run=True,benchmark=False, deterministic=True)
+    #trainer = pl.Trainer(logger=flow_logger,progress_bar_refresh_rate=20,gpus=1, max_epochs=1000,log_save_interval=500,
+    #    row_log_interval=500,benchmark=False, deterministic=False)
     trainer.fit(model)
