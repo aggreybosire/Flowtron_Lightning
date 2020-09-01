@@ -658,53 +658,6 @@ class Flowtron(pl.LightningModule):
             flow.gate_threshold = gate_threshold
 
     
-    def warmstart(self,checkpoint_path, model, include_layers=None):
-        print("Warm starting model", checkpoint_path)
-        pretrained_dict = torch.load(checkpoint_path, map_location='cpu')
-        if 'model' in pretrained_dict:
-            pretrained_dict = pretrained_dict['model'].state_dict()
-        else:
-            pretrained_dict = pretrained_dict['state_dict']
-
-        if include_layers is not None:
-            pretrained_dict = {k: v for k, v in pretrained_dict.items()
-                            if any(l in k for l in include_layers)}
-
-        model_dict = model.state_dict()
-        pretrained_dict = {k: v for k, v in pretrained_dict.items()
-                        if k in model_dict}
-
-        if pretrained_dict['speaker_embedding.weight'].shape != model_dict['speaker_embedding.weight'].shape:
-            del pretrained_dict['speaker_embedding.weight']
-
-        model_dict.update(pretrained_dict)
-        model.load_state_dict(model_dict)
-        return model
-
-
-    def on_load_checkpoint(self,checkpoint_path, model, optimizer, ignore_layers=[]):
-        assert os.path.isfile(checkpoint_path)
-        checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
-        iteration = checkpoint_dict['iteration']
-        model_dict = checkpoint_dict['model'].state_dict()
-
-        if len(ignore_layers) > 0:
-            model_dict = {k: v for k, v in model_dict.items()
-                        if k not in ignore_layers}
-            dummy_dict = model.state_dict()
-            dummy_dict.update(model_dict)
-            model_dict = dummy_dict
-        else:
-            optimizer.load_state_dict(checkpoint_dict['optimizer'])
-
-        model.load_state_dict(model_dict)
-        print("Loaded checkpoint '{}' (iteration {})" .format(
-            checkpoint_path, iteration))
-        return model, optimizer, iteration
-
-
-    
-
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=train_config['learning_rate'],
                                  weight_decay=train_config['weight_decay'])
@@ -842,11 +795,33 @@ if __name__ == "__main__":
     if train_config['with_tensorboard'] and rank == 0:
         flow_logger = TensorBoardLogger(os.path.join(output_directory, 'logs'))
     
-    # checkpoint_path = "{}/model_{}".format(
-    #                     output_directory, self.global_step)
+    def warmstart(checkpoint_path, model, include_layers=None):
+        print("Warm starting model", checkpoint_path)
+        pretrained_dict = torch.load(checkpoint_path, map_location='cpu')
+        if 'model' in pretrained_dict:
+            pretrained_dict = pretrained_dict['model'].state_dict()
+        else:
+            pretrained_dict = pretrained_dict['state_dict']
+
+        if include_layers is not None:
+            pretrained_dict = {k: v for k, v in pretrained_dict.items()
+                              if any(l in k for l in include_layers)}
+
+        model_dict = model.state_dict()
+        pretrained_dict = {k: v for k, v in pretrained_dict.items()
+                          if k in model_dict}
+
+        if pretrained_dict['speaker_embedding.weight'].shape != model_dict['speaker_embedding.weight'].shape:
+            del pretrained_dict['speaker_embedding.weight']
+
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict)
+        return model
+
 
     model = Flowtron(**model_config)
-    trainer = pl.Trainer(logger=flow_logger,progress_bar_refresh_rate=20,gpus=1,fast_dev_run=True,benchmark=False, deterministic=True)
-    #trainer = pl.Trainer(logger=flow_logger,progress_bar_refresh_rate=20,gpus=1, max_epochs=1000,log_save_interval=500,
-    #    row_log_interval=500,benchmark=False, deterministic=False)
+    if train_config['warmstart_checkpoint_path'] != "":
+        model = warmstart(train_config['warmstart_checkpoint_path'], model, train_config['include_layers'])
+    #trainer = pl.Trainer(logger=flow_logger,progress_bar_refresh_rate=20,gpus=1,fast_dev_run=True,benchmark=False, deterministic=True,limit_train_batches=0.01, limit_val_batches=0.01,)
+    trainer = pl.Trainer.from_argparse_args(args,logger=flow_logger,progress_bar_refresh_rate=20,  max_epochs=train_config['epochs'],precision=16,log_save_interval=train_config['iters_per_checkpoint'])
     trainer.fit(model)
