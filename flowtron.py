@@ -61,8 +61,11 @@ def get_mask_from_lengths(lengths):
     Returns:
         mask (torch.tensor): num_sequences x max_length x 1 binary tensor
     """
+    
     max_len = torch.max(lengths).item()
-    ids = torch.arange(0, max_len, out=torch.cuda.LongTensor(max_len))
+    
+    #ids = torch.arange(0, max_len, out=torch.cuda.LongTensor(max_len))
+    ids = torch.arange(0, max_len).long().to(lengths.device)
     mask = (ids < lengths.unsqueeze(1)).bool()
     return mask
 
@@ -230,9 +233,9 @@ class MelEncoder(nn.Module):
                             bidirectional=True)
 
     def run_padded_sequence(self, sorted_idx, unsort_idx, lens, padded_data, recurrent_model):
-        """Sorts input data by previded ordering (and un-ordering) and runs the packed data
+        """
+        Sorts input data by previded ordering (and un-ordering) and runs the packed data
         through the recurrent model
-
         Args:
             sorted_idx (torch.tensor): 1D sorting index
             unsort_idx (torch.tensor): 1D unsorting index (inverse of sorted_idx)
@@ -353,7 +356,7 @@ class Encoder(nn.Module):
             for conv in self.convolutions:
                 x = F.dropout(F.relu(conv(x)), 0.5, self.training)
             x = x.transpose(1, 2)
-        x = nn.utils.rnn.pack_padded_sequence(x, in_lens.cpu(), batch_first=True)
+        x = nn.utils.rnn.pack_padded_sequence(x, in_lens, batch_first=True)
 
         self.lstm.flatten_parameters()
         outputs, _ = self.lstm(x)
@@ -466,7 +469,6 @@ class AR_Step(torch.nn.Module):
                             recurrent_model):
         """Sorts input data by previded ordering (and un-ordering) and runs the
         packed data through the recurrent model
-
         Args:
             sorted_idx (torch.tensor): 1D sorting index
             unsort_idx (torch.tensor): 1D unsorting index (inverse of sorted_idx)
@@ -490,7 +492,8 @@ class AR_Step(torch.nn.Module):
 
     def forward(self, mel, text, mask, out_lens):
         dummy = torch.FloatTensor(1, mel.size(1), mel.size(2)).zero_()
-        dummy = dummy.type(mel.type())
+        #dummy = dummy.type(mel.type())
+        dummy = dummy.to(mel)
         # seq_len x batch x dim
         mel0 = torch.cat([dummy, mel[:-1, :, :]], 0)
         if out_lens is not None:
@@ -533,7 +536,6 @@ class AR_Step(torch.nn.Module):
         mel = torch.exp(log_s) * mel + b
         return mel, log_s, gates, attention_weights
 
-    
     def infer(self, residual, text):
         attention_weights = []
         total_output = []  # seems 10FPS faster than pre-allocation
@@ -567,7 +569,7 @@ class AR_Step(torch.nn.Module):
         return total_output, attention_weights
 
 
-class Flowtron(pl.LightningModule):
+class Flowtron(torch.nn.Module):
     def __init__(self, n_speakers, n_speaker_dim, n_text, n_text_dim, n_flows,
                  n_mel_channels, n_hidden, n_attn_channels, n_lstm_layers,
                  use_gate_layer, mel_encoder_n_hidden, n_components,
@@ -629,8 +631,7 @@ class Flowtron(pl.LightningModule):
             log_s_list.append(log_s)
             attns_list.append(attn)
         return mel, log_s_list, gate, attns_list,  mean, log_var, prob
-    
-    
+
     def infer(self, residual, speaker_vecs, text, temperature=1.0,
               gate_threshold=0.5):
         speaker_vecs = speaker_vecs*0 if self.dummy_speaker_embedding else speaker_vecs
@@ -657,7 +658,6 @@ class Flowtron(pl.LightningModule):
         if hasattr(flow, 'gate_layer'):
             flow.gate_threshold = gate_threshold
 
-    
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=train_config['learning_rate'],
                                  weight_decay=train_config['weight_decay'])
